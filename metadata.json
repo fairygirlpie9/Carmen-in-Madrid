@@ -1,0 +1,7 @@
+{
+  "name": "Carmen in Madrid",
+  "description": "An immersive language learning journal set in Madrid, featuring AI-powered roleplay and pronunciation coaching.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
