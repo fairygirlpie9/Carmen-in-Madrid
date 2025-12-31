@@ -1,8 +1,8 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Play, Mic, Volume2, CheckCircle, AlertCircle, Loader2, ImageOff, ArrowRight, ArrowLeft, BookOpen, MapPin, Feather, Bookmark, Home, Headphones, X } from 'lucide-react';
-import { generateSpeech, analyzePronunciation } from '../services/gemini';
-import { EPISODE_ONE, COVER_IMAGE_URL } from '../constants';
-import { AppState, CharacterRole, DialogueLine, SectionType, DictionaryEntry, Scene } from '../types';
+import { Play, Mic, Volume2, CheckCircle, AlertCircle, Loader2, ImageOff, ArrowRight, ArrowLeft, BookOpen, MapPin, Feather, Bookmark, Home, Headphones, X, MessageSquare, Send } from 'lucide-react';
+import { generateSpeech, analyzePronunciation, interactWithMateo, interactWithMateoText, MateoResponse } from '../services/gemini';
+import { EPISODE_ONE, COVER_IMAGE_URL, MATEO_PROMPTS } from '../constants';
+import { AppState, CharacterRole, DialogueLine, SectionType, DictionaryEntry, Scene, ChatMessage } from '../types';
 import { saveProgress, saveDictionaryWord, getDictionary } from '../utils/storage';
 
 interface JournalProps {
@@ -25,6 +25,11 @@ const Journal: React.FC<JournalProps> = ({ apiKey }) => {
   const [showCover, setShowCover] = useState(true);
   const [showDictionary, setShowDictionary] = useState(false);
   const [dictionary, setDictionary] = useState<DictionaryEntry[]>([]);
+  
+  // Chat State
+  const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
+  const [suggestions, setSuggestions] = useState(MATEO_PROMPTS); // Dynamic suggestions
+  const chatEndRef = useRef<HTMLDivElement>(null);
   
   // Settings State
   const [isAmbienceEnabled, setIsAmbienceEnabled] = useState(true);
@@ -60,13 +65,10 @@ const Journal: React.FC<JournalProps> = ({ apiKey }) => {
   }, []);
 
   // --- Ambience Control (Revised) ---
-  
-  // 1. Initialize Audio Object once
   useEffect(() => {
     const audio = new Audio();
     audio.loop = true;
-    audio.volume = 0.5; // Increased volume from 0.1 to 0.5
-    // Allow cross origin to prevent some potential CORS issues with Google assets
+    audio.volume = 0.5;
     audio.crossOrigin = "anonymous"; 
     ambienceRef.current = audio;
 
@@ -78,61 +80,56 @@ const Journal: React.FC<JournalProps> = ({ apiKey }) => {
     };
   }, []);
 
-  // 2. Manage Playback State
   useEffect(() => {
     const audio = ambienceRef.current;
     if (!audio) return;
 
-    // Determine if we should be playing
     const shouldPlay = !showCover && 
                        currentSection !== SectionType.MENU && 
+                       currentSection !== SectionType.CHAT && // Mute ambience during chat
                        isAmbienceEnabled && 
                        !!currentScene?.ambience;
 
     if (shouldPlay) {
-        // If the source is different, update and load
         if (currentScene?.ambience && audio.src !== currentScene.ambience) {
             audio.src = currentScene.ambience;
             audio.load();
         }
-        
-        // Attempt to play
-        // We use a small timeout to prevent rapid play/pause conflicts during React render cycles
         const playPromise = audio.play();
         if (playPromise !== undefined) {
             playPromise.catch(error => {
-                // Auto-play might be blocked until user interacts with the page
-                // or if the browser doesn't support the format (OGG on older Safari)
                 console.warn("Ambience play prevented:", error);
             });
         }
     } else {
-        // Pause if we shouldn't be playing
         audio.pause();
     }
   }, [currentScene, showCover, currentSection, isAmbienceEnabled]);
 
+  // --- Scroll Chat to Bottom ---
+  useEffect(() => {
+    if (currentSection === SectionType.CHAT && chatEndRef.current) {
+        chatEndRef.current.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [chatHistory, currentSection]);
+
 
   // --- Audio Preloading (Smart Lookahead) ---
   useEffect(() => {
-    if (!apiKey || !currentScene || !currentLine) return;
+    if (!apiKey || !currentScene || !currentLine || currentSection === SectionType.CHAT) return;
 
     const loadAudioForLine = async (line: DialogueLine) => {
       if (line.role === CharacterRole.CARMEN && currentSection !== SectionType.VOCAB) return;
-      // In Vocab mode, even Carmen lines might want a reference audio (or we just skip it)
       
       const cacheKey = `${line.id}-${line.role}`;
-      // Check Memory Cache first
       if (audioCache[cacheKey] || audioLoadingRef.current.has(cacheKey)) return;
 
       try {
         audioLoadingRef.current.add(cacheKey);
-        // Use a different voice for 'Narrator' vs 'Mateo'
         let voice = 'Puck';
         if (line.role === CharacterRole.NARRATOR) voice = 'Fenrir';
         else if (line.role === CharacterRole.MATEO) voice = 'Charon';
 
-        // Check Persistent DB Cache via generateSpeech's new parameter
         const uniqueStorageKey = `tts_${line.id}_${voice}`;
         const buffer = await generateSpeech(line.spanish, voice, uniqueStorageKey);
         
@@ -146,7 +143,6 @@ const Journal: React.FC<JournalProps> = ({ apiKey }) => {
 
     const managePreload = async () => {
         await loadAudioForLine(currentLine);
-        // Look ahead
         const nextLineIdx = lineIndex + 1;
         if (nextLineIdx < currentScene.script.length) {
              setTimeout(() => loadAudioForLine(currentScene.script[nextLineIdx]), 500);
@@ -188,6 +184,22 @@ const Journal: React.FC<JournalProps> = ({ apiKey }) => {
     setTimeout(() => setPageTurnState('idle'), 650);
   };
 
+  const playBuffer = async (buffer: AudioBuffer) => {
+      if (!audioContextRef.current) {
+        audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+      }
+      const ctx = audioContextRef.current;
+      if (ctx.state === 'suspended') await ctx.resume();
+
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+      source.start(0);
+      return new Promise((resolve) => {
+          source.onended = resolve;
+      });
+  };
+
   const handlePlayAudio = async () => {
     if (appState !== AppState.IDLE || !currentLine) return;
     
@@ -196,38 +208,34 @@ const Journal: React.FC<JournalProps> = ({ apiKey }) => {
       const cacheKey = `${currentLine.id}-${currentLine.role}`;
       let buffer = audioCache[cacheKey];
 
-      // Voice selection logic
       let voice = 'Puck';
       if (currentLine.role === CharacterRole.NARRATOR) voice = 'Fenrir';
       else if (currentLine.role === CharacterRole.MATEO) voice = 'Charon';
 
       if (!buffer) {
-        // Not in memory, fetch from DB or API
         const uniqueStorageKey = `tts_${currentLine.id}_${voice}`;
         buffer = await generateSpeech(currentLine.spanish, voice, uniqueStorageKey) as AudioBuffer;
-        
         if (buffer) audioCache[cacheKey] = buffer;
       }
       
       if (buffer) {
-        if (!audioContextRef.current) {
-            audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
-        }
-        const ctx = audioContextRef.current;
-        if (ctx.state === 'suspended') await ctx.resume();
-
-        const source = ctx.createBufferSource();
-        source.buffer = buffer;
-        source.connect(ctx.destination);
-        source.start(0);
-        source.onended = () => setAppState(AppState.IDLE);
-      } else {
-        setAppState(AppState.IDLE);
+        await playBuffer(buffer);
       }
     } catch (e: any) {
       console.error(e);
-      setAppState(AppState.IDLE);
+    } finally {
+        setAppState(AppState.IDLE);
     }
+  };
+
+  const playChatResponse = async (text: string) => {
+      setAppState(AppState.PLAYING_AUDIO);
+      // Use 'Charon' for Mateo
+      const buffer = await generateSpeech(text, 'Charon'); 
+      if (buffer) {
+          await playBuffer(buffer);
+      }
+      setAppState(AppState.IDLE);
   };
 
   const startRecording = async (e: React.MouseEvent | React.TouchEvent) => {
@@ -238,15 +246,10 @@ const Journal: React.FC<JournalProps> = ({ apiKey }) => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       
-      // Determine supported mime type
       let mimeType = '';
-      if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
-        mimeType = 'audio/webm;codecs=opus';
-      } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
-        mimeType = 'audio/mp4'; // Safari
-      } else if (MediaRecorder.isTypeSupported('audio/webm')) {
-        mimeType = 'audio/webm';
-      }
+      if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) mimeType = 'audio/webm;codecs=opus';
+      else if (MediaRecorder.isTypeSupported('audio/mp4')) mimeType = 'audio/mp4'; 
+      else if (MediaRecorder.isTypeSupported('audio/webm')) mimeType = 'audio/webm';
       
       mimeTypeRef.current = mimeType;
       const options = mimeType ? { mimeType } : undefined;
@@ -262,27 +265,65 @@ const Journal: React.FC<JournalProps> = ({ apiKey }) => {
       };
 
       mediaRecorder.onstop = async () => {
-        // Use the mimeType we determined, or fallback to the recorder's actual type
         const type = mimeTypeRef.current || mediaRecorder.mimeType || 'audio/webm';
         const audioBlob = new Blob(audioChunksRef.current, { type });
-        setAppState(AppState.ANALYZING);
         
-        const result = await analyzePronunciation(audioBlob, currentLine!.spanish);
-        setFeedback(result);
-        setAppState(AppState.IDLE);
-        stream.getTracks().forEach(track => track.stop());
+        if (currentSection === SectionType.CHAT) {
+            // Chat Flow
+            setAppState(AppState.THINKING);
+            try {
+                const response: MateoResponse = await interactWithMateo(audioBlob, chatHistory);
+                
+                // Add User Message
+                const userMsg: ChatMessage = {
+                    id: Date.now().toString(),
+                    role: 'user',
+                    spanish: response.userTranscription,
+                    english: "..." // We don't translate user for now, or could ask Gemini
+                };
+                
+                // Add Mateo Message
+                const mateoMsg: ChatMessage = {
+                    id: (Date.now() + 1).toString(),
+                    role: 'mateo',
+                    spanish: response.spanishResponse,
+                    english: response.englishTranslation
+                };
+                
+                setChatHistory(prev => [...prev, userMsg, mateoMsg]);
 
-        // Check if the result indicates quota exceeded
-        if (currentSection === SectionType.VOCAB && result.score > 60) {
-            // Save to dictionary if practicing Vocab
-            const entry: DictionaryEntry = {
-                spanish: currentLine!.spanish,
-                english: currentLine!.english,
-                dateAdded: Date.now()
-            };
-            saveDictionaryWord(entry);
-            setDictionary(getDictionary());
+                // Update suggestions for the next turn
+                if (response.suggestions && response.suggestions.length > 0) {
+                    setSuggestions(response.suggestions);
+                }
+                
+                // Play Audio
+                playChatResponse(response.spanishResponse);
+                
+            } catch (err) {
+                console.error("Chat error", err);
+                setAppState(AppState.IDLE);
+            }
+
+        } else {
+            // Standard Analysis Flow
+            setAppState(AppState.ANALYZING);
+            const result = await analyzePronunciation(audioBlob, currentLine!.spanish);
+            setFeedback(result);
+            setAppState(AppState.IDLE);
+
+            if (currentSection === SectionType.VOCAB && result.score > 60) {
+                const entry: DictionaryEntry = {
+                    spanish: currentLine!.spanish,
+                    english: currentLine!.english,
+                    dateAdded: Date.now()
+                };
+                saveDictionaryWord(entry);
+                setDictionary(getDictionary());
+            }
         }
+        
+        stream.getTracks().forEach(track => track.stop());
       };
 
       mediaRecorder.start();
@@ -292,6 +333,40 @@ const Journal: React.FC<JournalProps> = ({ apiKey }) => {
       console.error(err);
       setAppState(AppState.IDLE);
     }
+  };
+
+  const handleChatPromptClick = async (prompt: { spanish: string; english: string }) => {
+      setAppState(AppState.THINKING);
+      try {
+          const response: MateoResponse = await interactWithMateoText(prompt.spanish, chatHistory);
+           // Add User Message
+           const userMsg: ChatMessage = {
+            id: Date.now().toString(),
+            role: 'user',
+            spanish: prompt.spanish,
+            english: prompt.english
+        };
+        
+        // Add Mateo Message
+        const mateoMsg: ChatMessage = {
+            id: (Date.now() + 1).toString(),
+            role: 'mateo',
+            spanish: response.spanishResponse,
+            english: response.englishTranslation
+        };
+        
+        setChatHistory(prev => [...prev, userMsg, mateoMsg]);
+
+        // Update suggestions for the next turn
+        if (response.suggestions && response.suggestions.length > 0) {
+            setSuggestions(response.suggestions);
+        }
+
+        playChatResponse(response.spanishResponse);
+      } catch (err) {
+          console.error("Chat prompt error", err);
+          setAppState(AppState.IDLE);
+      }
   };
 
   const stopRecording = (e: React.MouseEvent | React.TouchEvent) => {
@@ -320,18 +395,14 @@ const Journal: React.FC<JournalProps> = ({ apiKey }) => {
     if (lineIndex < currentScene.script.length - 1) {
         setLineIndex(prev => prev + 1);
     } else {
-        // End of Scene logic
         if (currentSection === SectionType.STORY) {
             if (sceneIndex < EPISODE_ONE.story.length - 1) {
-                // Next Story Scene
                 handleTurnPage(true);
             } else {
-                // End of Episode -> Go to Menu
                 navigateToSection(SectionType.MENU);
                 saveProgress('completed_ep1');
             }
         } else {
-            // End of Insight or Vocab -> Return to Menu
             navigateToSection(SectionType.MENU);
         }
     }
@@ -343,7 +414,6 @@ const Journal: React.FC<JournalProps> = ({ apiKey }) => {
     } else if (currentSection === SectionType.STORY && sceneIndex > 0) {
         handleTurnPage(false);
     } else if (currentSection !== SectionType.STORY) {
-        // If we are at the beginning of Insight or Vocab, go back to Menu
         navigateToSection(SectionType.MENU);
     }
   };
@@ -391,7 +461,7 @@ const Journal: React.FC<JournalProps> = ({ apiKey }) => {
   // --- Mission Report / Menu View ---
   if (currentSection === SectionType.MENU) {
       return (
-        <div className={`relative w-full max-w-3xl aspect-auto md:aspect-[3/2] bg-[#FAFAFA] rounded-xl flex flex-col items-center justify-center p-8 md:p-12 shadow-journal overflow-hidden z-10 transition-all duration-700 ${pageTurnState === 'turning' ? 'opacity-0 scale-95' : 'opacity-100 scale-100'}`}>
+        <div className={`relative w-full max-w-3xl bg-[#FAFAFA] rounded-xl flex flex-col items-center justify-center p-8 md:p-12 shadow-journal overflow-hidden z-10 transition-all duration-700 ${pageTurnState === 'turning' ? 'opacity-0 scale-95' : 'opacity-100 scale-100'}`}>
             <div className="absolute inset-0 border-8 border-white pointer-events-none z-20 rounded-xl"></div>
             <div className="absolute top-0 left-0 w-full h-2 bg-gradient-to-r from-oak-light to-oak-dark opacity-50"></div>
             
@@ -404,6 +474,24 @@ const Journal: React.FC<JournalProps> = ({ apiKey }) => {
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 w-full max-w-2xl">
+                
+                 {/* Talk to Mateo - Full Width */}
+                 <button 
+                    onClick={() => navigateToSection(SectionType.CHAT)}
+                    className="md:col-span-2 group relative h-36 md:h-44 bg-ink text-white border border-gray-800 rounded-lg p-6 hover:shadow-xl transition-all text-left flex items-center justify-between overflow-hidden"
+                >
+                    <div className="absolute top-0 right-0 w-32 h-32 bg-white/10 rounded-full -mr-8 -mt-8 transition-transform group-hover:scale-110 blur-xl"></div>
+                    <div>
+                        <h4 className="font-bold font-serif text-xl md:text-2xl flex items-center gap-2">
+                             Talk to Mateo <MessageSquare className="w-5 h-5 opacity-70" />
+                        </h4>
+                        <p className="text-xs text-white/60 mt-1 uppercase tracking-wider">Practice with AI • Local Secrets</p>
+                    </div>
+                    <div className="w-12 h-12 rounded-full bg-white/10 flex items-center justify-center border border-white/20">
+                         <Play className="w-5 h-5 fill-current" />
+                    </div>
+                </button>
+
                 <button 
                     onClick={() => navigateToSection(SectionType.INSIGHT)}
                     className="group relative h-40 bg-white border border-gray-200 rounded-lg p-6 hover:shadow-lg transition-all text-left flex flex-col justify-between overflow-hidden"
@@ -439,13 +527,125 @@ const Journal: React.FC<JournalProps> = ({ apiKey }) => {
       );
   }
 
+  // --- Chat View ---
+  if (currentSection === SectionType.CHAT) {
+      return (
+        <div className={`relative w-full max-w-3xl aspect-[3/4] md:aspect-[3/2] bg-[#FAFAFA] rounded-xl flex flex-col shadow-journal overflow-hidden z-10 transition-all duration-700 ${pageTurnState === 'turning' ? 'opacity-0 scale-95' : 'opacity-100 scale-100'}`}>
+            {/* Chat Header */}
+            <div className="bg-white border-b border-gray-200 p-4 md:p-6 flex justify-between items-center sticky top-0 z-20">
+                <div className="flex items-center gap-3">
+                    <button onClick={() => navigateToSection(SectionType.MENU)} className="text-gray-400 hover:text-ink transition-colors">
+                        <ArrowLeft className="w-6 h-6" />
+                    </button>
+                    <div>
+                        <h2 className="font-serif font-bold text-xl text-ink leading-none">Mateo's Hotspots</h2>
+                        <span className="text-[10px] font-sans font-bold text-green-600 uppercase tracking-widest flex items-center gap-1">
+                            <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span> Online
+                        </span>
+                    </div>
+                </div>
+                <div className="w-10 h-10 rounded-full bg-gray-200 overflow-hidden border-2 border-white shadow-sm">
+                    {/* Placeholder Avatar for Mateo */}
+                     <img src="https://i.ibb.co/395z7DWb/1B.png" className="w-full h-full object-cover grayscale" alt="Mateo" /> 
+                </div>
+            </div>
+
+            {/* Chat Body */}
+            <div className="flex-1 overflow-y-auto p-4 md:p-6 space-y-4 bg-[#F5F5F0]">
+                {chatHistory.length === 0 && (
+                    <div className="text-center mt-10 opacity-50">
+                        <p className="font-serif italic text-gray-500">Start the conversation...</p>
+                    </div>
+                )}
+                
+                {chatHistory.map((msg) => (
+                    <div key={msg.id} className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
+                        <div className={`max-w-[80%] rounded-2xl px-4 py-3 shadow-sm ${msg.role === 'user' ? 'bg-ink text-white rounded-br-none' : 'bg-white text-ink border border-gray-200 rounded-bl-none'}`}>
+                            <p className="text-base font-medium">{msg.spanish}</p>
+                        </div>
+                        {msg.english && (
+                             <p className={`mt-1 font-serif italic max-w-[80%] ${msg.role === 'user' ? 'text-right text-gray-400 text-xs mr-2' : 'ml-2 text-gray-500 text-sm'}`}>{msg.english}</p>
+                        )}
+                    </div>
+                ))}
+                
+                {appState === AppState.THINKING && (
+                     <div className="flex flex-col items-start animate-pulse">
+                        <div className="bg-white border border-gray-200 rounded-2xl rounded-bl-none px-4 py-3 shadow-sm">
+                            <div className="flex gap-1">
+                                <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce"></span>
+                                <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce delay-75"></span>
+                                <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce delay-150"></span>
+                            </div>
+                        </div>
+                        <p className="text-[10px] text-gray-400 mt-1 ml-2 uppercase tracking-wider">Mateo is typing...</p>
+                    </div>
+                )}
+
+                {appState === AppState.PLAYING_AUDIO && (
+                     <div className="flex items-center gap-2 text-teal-muted text-xs font-bold uppercase tracking-wider pl-2">
+                        <Volume2 className="w-3 h-3 animate-pulse" /> Mateo is speaking...
+                     </div>
+                )}
+                
+                <div ref={chatEndRef} />
+            </div>
+
+            {/* Chat Footer (Controls) */}
+            <div className="bg-white border-t border-gray-200 p-4">
+                {/* Prompts - Always visible if suggestions exist */}
+                {suggestions.length > 0 && (
+                    <div className="flex gap-3 overflow-x-auto pb-4 scrollbar-hide">
+                        {suggestions.map((prompt, i) => (
+                            <button 
+                                key={i}
+                                onClick={() => handleChatPromptClick(prompt)}
+                                className="flex-none w-64 p-4 bg-gray-50 hover:bg-gray-100 border border-gray-200 rounded-xl transition-all hover:shadow-md flex flex-col gap-2 text-left"
+                            >
+                                <span className="font-serif font-bold text-ink text-base leading-tight">{prompt.spanish}</span>
+                                <span className="font-sans text-xs text-gray-500 uppercase tracking-wide leading-snug">{prompt.english}</span>
+                            </button>
+                        ))}
+                    </div>
+                )}
+
+                <div className="flex items-center gap-4 justify-center">
+                    <button 
+                        onMouseDown={startRecording}
+                        onMouseUp={stopRecording}
+                        onMouseLeave={stopRecording}
+                        onTouchStart={startRecording}
+                        onTouchEnd={stopRecording}
+                        disabled={appState === AppState.THINKING || appState === AppState.PLAYING_AUDIO}
+                        className={`w-full max-w-xs h-14 rounded-full flex items-center justify-center gap-2 transition-all shadow-lg border-2
+                            ${isRecording 
+                                ? 'bg-red-500 border-red-500 text-white shadow-red-500/30 scale-105' 
+                                : 'bg-white border-gray-200 text-ink hover:border-teal-muted'
+                            } disabled:opacity-50 disabled:scale-100 cursor-pointer select-none`}
+                    >
+                         {appState === AppState.THINKING ? (
+                             <Loader2 className="w-6 h-6 animate-spin text-gray-400" />
+                         ) : (
+                             <>
+                                <Mic className={`w-6 h-6 ${isRecording ? 'animate-pulse' : ''}`} />
+                                <span className="font-sans font-bold text-sm tracking-wide">
+                                    {isRecording ? "LISTENING..." : "HOLD TO SPEAK"}
+                                </span>
+                             </>
+                         )}
+                    </button>
+                </div>
+            </div>
+        </div>
+      );
+  }
+
   // --- Main View (Story, Insight, Vocab) ---
   
   if (!currentScene || !currentLine) return null; // Safety
 
   const isCarmen = currentLine.role === CharacterRole.CARMEN;
   const isNarrator = currentLine.role === CharacterRole.NARRATOR;
-  // In Vocab mode, everyone can practice Narrator lines too if they want, but mainly Carmen
   const canRecord = isCarmen || isNarrator || currentSection === SectionType.VOCAB;
   const showListen = !isCarmen || currentSection === SectionType.VOCAB; 
 

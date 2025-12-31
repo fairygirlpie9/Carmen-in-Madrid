@@ -1,12 +1,12 @@
 <div align="center">
-<img src="https://i.ibb.co/V0rqRPf0/Carmen-In-Madrid-A-Telenovela.png" alt="Carmen In Madrid A Telenovela" border="0">
+<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
 </div>
 
-# Carmen in Madrid
+# Run and deploy your AI Studio app
 
-Run and deploy this AI Studio app
-This contains everything you need to run this app locally.
-View the app in AI Studio: https://ai.studio/apps/drive/1GeH0ap00FjbPo3ET_x_FzhzuFzPrKJl9
+This contains everything you need to run your app locally.
+
+View your app in AI Studio: https://ai.studio/apps/drive/1GeH0ap00FjbPo3ET_x_FzhzuFzPrKJl9
 
 ## Run Locally
 

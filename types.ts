@@ -32,6 +32,7 @@ export enum AppState {
   PLAYING_AUDIO = 'PLAYING_AUDIO',
   RECORDING = 'RECORDING',
   ANALYZING = 'ANALYZING',
+  THINKING = 'THINKING', // New state for Chat processing
 }
 
 export enum SectionType {
@@ -39,10 +40,18 @@ export enum SectionType {
   MENU = 'MENU', // The "Mission Report" / Hub
   INSIGHT = 'INSIGHT',
   VOCAB = 'VOCAB',
+  CHAT = 'CHAT', // New Section
 }
 
 export interface DictionaryEntry {
   spanish: string;
   english: string;
   dateAdded: number;
+}
+
+export interface ChatMessage {
+  id: string;
+  role: 'user' | 'mateo';
+  spanish: string;
+  english?: string; // User might not have translation immediately, but Mateo will
 }
